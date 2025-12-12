@@ -6,8 +6,12 @@ import sys
 
 ##### Configuration #####
 
-# 0 -> read, 1 -> erase, 2 -> write
-mode = 0
+class Mode:
+    READ = 0
+    ERASE = 1
+    WRITE = 2
+
+mode = Mode.READ
 
 firmware_file = "ec.bin"
 log_file = "log.txt"
@@ -25,7 +29,6 @@ send_waveform = True
 verify = True
 disable_watchdog = True
 disable_protect_path = True
-wdt_enable = False
 
 
 ##### Constants #####
@@ -137,26 +140,27 @@ def error(string, exception=None, reset=False):
 
 class ITEFlasher:
 
-    def __init__(self, sda_pin, scl_pin, i2c_freq=400_000, send_waveform=True, verify=True, disable_watchdog=True, disable_protect_path=True, wdt_enable=False):
+    def __init__(self, sda_pin, scl_pin, i2c_freq=400_000, send_waveform=True, verify=True, disable_watchdog=True, disable_protect_path=True):
         # Create PIO state machine
         # Note: Frequency of 400 KHz gives cycle time of 2.5us
         # Note: Frequency of 800 KHz gives cycle time of 1.25us, meaning an instruction with [1] after gives total time of 2.5us
         # Note: Frequency of 1.6 MHz gives cycle time of 0.625us, meaning an instruction with [1] after gives total time of 1.25us
-        self.sm = rp2.StateMachine(0, ITEFlasher._waveform_pio_program, freq=1_600_000, set_base=Pin(sda_pin))
+        self._sm = rp2.StateMachine(0, ITEFlasher._waveform_pio_program, freq=1_600_000, set_base=Pin(sda_pin))
 
         # Set the interrupt handler that signals end of waveform by setting a boolean
-        self.sm.irq(handler=lambda sm: self._complete_waveform())
+        self._sm.irq(handler=lambda sm: self._complete_waveform())
 
+        self._i2c = I2C(0, scl=Pin(scl_pin), sda=Pin(sda_pin), freq=i2c_freq)
+
+        # Flags set by other methods
         self.waveform_complete = False
-
-        self.i2c = I2C(0, scl=Pin(scl_pin), sda=Pin(sda_pin), freq=i2c_freq)
+        self.wdt_enabled = False
 
         # Config
         self.send_waveform = send_waveform
         self.verify = verify
         self.disable_watchdog = disable_watchdog
         self.disable_protect_path = disable_protect_path
-        self.wdt_enable = wdt_enable
 
         # Config (set by check_chipid)
         self.flash_cmd_v2 = False
@@ -165,7 +169,7 @@ class ITEFlasher:
         self.it5xxxx = False
         self.flash_size = 0
 
-        # Config (set by other functions)
+        # Config (set by check_flashid)
         self.eflash_type = 0
         self.spi_cmd_sector_erase = 0
         self.sector_erase_pages = 0 # Embedded flash number of pages in a sector erase
@@ -178,7 +182,6 @@ class ITEFlasher:
             # Wait 10ms for EC chip to be ready before proceeding with I2C communication
             utime.sleep_ms(10)
 
-
         ec_responding = self.check_ec_responding()
 
         # If no EC response, reset the microcontroller to try again
@@ -187,7 +190,6 @@ class ITEFlasher:
 
         log("EC is responding!\n")
         blink_led_success()
-
 
         try:
             # Stop EC ASAP after sending special waveform
@@ -198,7 +200,6 @@ class ITEFlasher:
         log("dbgr_stop_ec completed!\n")
         blink_led_success()
 
-
         try:
             self.check_chipid()
         except Exception as e:
@@ -207,19 +208,17 @@ class ITEFlasher:
         log("Successfully fetched chip ID!\n")
         blink_led_success()
 
-
         # TODO: Fix dbgr_reset_gpio and uncomment the below if experiencing issues with later functions
         # Note: This is commented out since dbgr_reset_gpio freezes
 
         # try:
-        #     # Turn off power rails by reset GPIOs to default (input)
+        #     # Turn off power rails by resetting GPIOs to default (input)
         #     self.dbgr_reset_gpio()
         # except Exception as e:
         #     error("dbgr_reset_gpio failed!")
         # 
         # log("dbgr_reset_gpio completed!\n")
         # blink_led_success()
-
 
         try:
             self.check_flashid()
@@ -229,7 +228,6 @@ class ITEFlasher:
         log("Successfully fetched flash ID!\n")
         blink_led_success()
 
-
         try:
             # Add wdt restart to prevent wdt interrupt flashing
             self.restart_wdt()
@@ -238,7 +236,6 @@ class ITEFlasher:
 
         log("Restart wdt completed!\n")
         blink_led_success()
-
 
         try:
             self.post_waveform_work()
@@ -293,12 +290,12 @@ class ITEFlasher:
         start_us = utime.ticks_us()
 
         # Turn on PIO state machine (i.e. start sending bitbang waveform)
-        self.sm.active(1)
+        self._sm.active(1)
 
         # Set the number of iterations for the waveform signal
         # Note: This has to be passed to the state machine from here and not put as an immediate value in the PIO code because the set instruction can only take values from 0-31
         num_iter = 2000
-        self.sm.put(num_iter - 1)
+        self._sm.put(num_iter - 1)
 
         # Wait for state machine to finish executing
         while not self.waveform_complete:
@@ -310,7 +307,7 @@ class ITEFlasher:
         log(f"Waveform duration: {elapsed_us} us")
 
         # Turn off PIO state machine
-        self.sm.active(0)
+        self._sm.active(0)
     
 
     ##### I2C Scan #####
@@ -319,7 +316,7 @@ class ITEFlasher:
     def check_ec_responding(self):
         ec_responding = False
         
-        devices = self.i2c.scan()
+        devices = self._i2c.scan()
             
         if devices:
             cmd_address_found = False
@@ -327,9 +324,9 @@ class ITEFlasher:
             
             for device in devices:
                 log(hex(device))
-                if (device == I2C_CMD_ADDR): # Check if it is EC cmd address
+                if (device == I2C_CMD_ADDR): # Check if EC cmd address
                     cmd_address_found = True
-                elif (device == I2C_DATA_ADDR): # Check if it is EC data address
+                elif (device == I2C_DATA_ADDR): # Check if EC data address
                     data_address_found = True
             
             if cmd_address_found and data_address_found:
@@ -344,13 +341,13 @@ class ITEFlasher:
 
     # Write command to then write byte to EC chip
     def _i2c_write_byte(self, cmd, data):
-        self.i2c.writeto(I2C_CMD_ADDR, bytes([cmd]))
-        self.i2c.writeto(I2C_DATA_ADDR, bytes([data]))
+        self._i2c.writeto(I2C_CMD_ADDR, bytes([cmd]))
+        self._i2c.writeto(I2C_DATA_ADDR, bytes([data]))
 
     # Write command to then read byte from EC chip
     def _i2c_read_byte(self, cmd):
-        self.i2c.writeto(I2C_CMD_ADDR, bytes([cmd]))
-        data = self.i2c.readfrom(I2C_DATA_ADDR, 1)[0]
+        self._i2c.writeto(I2C_CMD_ADDR, bytes([cmd]))
+        data = self._i2c.readfrom(I2C_DATA_ADDR, 1)[0]
         return data
 
     # Restart watchdog
@@ -363,7 +360,7 @@ class ITEFlasher:
 
     # Check if need wdt restart
     def check_wdt(self):
-        if self.wdt_enable:
+        if self.wdt_enabled:
             self.restart_wdt()
 
     def spi_flash_follow_mode(self):
@@ -412,8 +409,9 @@ class ITEFlasher:
         # Read version from chip
         ver = self._i2c_read_byte(0x02)
         
+        # TODO: Fix this since it seems to be broken (false is added for now to force it to not run)
         # Set various options based on chip ID and version
-        if False and ((id_ & 0xff00) != (CHIP_ID & 0xff00)): # False is added here to force this condition to not be true since it is broken
+        if False and ((id_ & 0xff00) != (CHIP_ID & 0xff00)):
             id_ |= 0xff0000
             id_third_byte = self.get_3rd_chip_id_byte()
             id_ = (id_third_byte << 16) | id_
@@ -463,16 +461,11 @@ class ITEFlasher:
     # TODO: Fix the freeze
     # Reset GPIOs to default
     def dbgr_reset_gpio(self):
-        log("Inside dbgr_reset_gpio...")
         if self.dbgr_addr_3bytes:
             self._i2c_write_byte(0x80, 0xf0)
-        log("1...")
         self._i2c_write_byte(0x2f, 0x20)
-        log("2...")
         self._i2c_write_byte(0x2e, 0x07)
-        log("3...")
         self._i2c_write_byte(0x30, 0x02) # This line freezes when done after previous lines in this function
-        log("Reached end of dbgr_reset_gpio!")
     
     # Fetches and logs flash ID, and sets the eflash type
     def check_flashid(self):
@@ -484,20 +477,20 @@ class ITEFlasher:
         self._i2c_write_byte(0x05, 0xfd)
         self._i2c_write_byte(0x08, 0x9f)
         
-        id_ = self.i2c.readfrom(I2C_DATA_ADDR, 16)
+        id_ = self._i2c.readfrom(I2C_DATA_ADDR, 16)
         
         if id_[0] == 0xff and id_[1] == 0xff and id_[2] == 0xfe:
-            log("EFLASH TYPE = 8315")
+            log("EFLASH type = 8315")
             self.eflash_type = EFLASH_TYPE_8315
             self.sector_erase_pages = 4
             self.spi_cmd_sector_erase = SPI_CMD_SECTOR_ERASE_1K
         elif id_[0] == 0xc8 or id_[0] == 0xef:
-            log("EFLASH TYPE = KGD")
+            log("EFLASH type = KGD")
             self.eflash_type = EFLASH_TYPE_KGD
             self.sector_erase_pages = 16
             self.spi_cmd_sector_erase = SPI_CMD_SECTOR_ERASE_4K
         else:
-            raise Exception(f"Invalid EFLASH TYPE: FLASH ID = {id_[0]:02x} {id_[1]:02x} {id_[2]:02x}")
+            raise Exception(f"Invalid EFLASH type: FLASH ID = {id_[0]:02x} {id_[1]:02x} {id_[2]:02x}")
     
     # Get watchdog
     def get_wdt_value(self):
@@ -531,9 +524,9 @@ class ITEFlasher:
         wdt = self.get_wdt_value()
         
         if wdt != 0x30:
-            log("DBGR DISABLE WATCHDOG FAILED!")
-            log(f"wdt={wdt:02x} => do restart wdt to avoid wdt interrupt flashing...")
-            self.wdt_enable = True
+            log("Failed to disable watchdog!")
+            log("Restarting wdt to avoid wdt interrupt flashing...")
+            self.wdt_enabled = True
             self.restart_wdt()
 
     # Disable protect path from DBGR
@@ -585,14 +578,14 @@ class ITEFlasher:
         self._i2c_write_byte(0x08, 0x00)
         
         # Use i2c block read command
-        self.i2c.writeto(I2C_CMD_ADDR, bytes([cmd]))
+        self._i2c.writeto(I2C_CMD_ADDR, bytes([cmd]))
 
     # Read pages of flash memory from address to address+size and return a buffer containing the data read
     def _command_read_pages(self, address, size):
         # We need to resend fast read command at 256KB boundary
         # If wdt_enable, we need to reduce to 4KB to avoid the wdt interrupt
         boundary = 0x40000 # 256K
-        if self.wdt_enable:
+        if self.wdt_enabled:
             boundary = 0x1000 # 4K
         
         if address & 0xFF:
@@ -610,7 +603,7 @@ class ITEFlasher:
             count = min(PAGE_SIZE, remaining)
             
             # Read page data
-            data = self.i2c.readfrom(I2C_BLOCK_ADDR, count)
+            data = self._i2c.readfrom(I2C_BLOCK_ADDR, count)
             buffer[offset:offset + count] = data
             
             address += count
@@ -627,6 +620,8 @@ class ITEFlasher:
 
     # Note: Due to the pico's 264kB of RAM, we can't just load up a copy of the firmware into memory since we may run out of space, hence the chunking
     def read_flash(self, filename):
+        log("Reading flash...")
+
         remaining = self.flash_size
         offset = 0
         
@@ -648,6 +643,8 @@ class ITEFlasher:
     # Read flash contents and compare it with contents of given file, and raise exception if content doesn't match
     # Note: Due to the pico's 264kB of RAM, we can't just load up two copies of the firmware into memory since we'll run out of space, hence the chunking
     def verify_flash(self, filename):
+        log("Verifying flash...")
+
         remaining = self.flash_size
         offset = 0
         
@@ -680,7 +677,7 @@ class ITEFlasher:
         self._spi_flash_command_short(SPI_CMD_READ_STATUS)
         
         while True:
-            reg = self.i2c.readfrom(I2C_DATA_ADDR, 1)[0]
+            reg = self._i2c.readfrom(I2C_DATA_ADDR, 1)[0]
             
             if (reg & 0x01) == 0:
                 # Busy bit cleared
@@ -690,7 +687,7 @@ class ITEFlasher:
         self._spi_flash_command_short(SPI_CMD_READ_STATUS)
         
         while True:
-            reg = self.i2c.readfrom(I2C_DATA_ADDR, 1)[0]
+            reg = self._i2c.readfrom(I2C_DATA_ADDR, 1)[0]
             
             if (reg & 0x03) == 2:
                 # Busy bit cleared and WE bit set
@@ -736,6 +733,8 @@ class ITEFlasher:
         self.spi_flash_follow_mode_exit()
 
     def erase_flash(self):
+        log("Erasing flash...")
+
         if self.flash_cmd_v2:
             self._command_erase_2()
         else:
@@ -749,6 +748,8 @@ class ITEFlasher:
     # Read flash contents and check if each byte is 0xFF, and raise exception if any byte isn't
     # Note: Due to the pico's 264kB of RAM, we can't just load up a copy of the firmware into memory since we may run out of space, hence the chunking
     def verify_flash_empty(self):
+        log("Verifying empty flash...")
+
         remaining = self.flash_size
         offset = 0
         
@@ -794,9 +795,9 @@ class ITEFlasher:
             self._spi_flash_command_short(SPI_CMD_WORD_PROGRAM)
             
             # Set eflash page address
-            self.i2c.writeto(I2C_DATA_ADDR, bytes([addr_H]))
-            self.i2c.writeto(I2C_DATA_ADDR, bytes([addr_M]))
-            self.i2c.writeto(I2C_DATA_ADDR, bytes([addr_L]))
+            self._i2c.writeto(I2C_DATA_ADDR, bytes([addr_H]))
+            self._i2c.writeto(I2C_DATA_ADDR, bytes([addr_M]))
+            self._i2c.writeto(I2C_DATA_ADDR, bytes([addr_L]))
             
             # Wait until not busy
             self._spi_poll_busy()
@@ -804,9 +805,9 @@ class ITEFlasher:
             # Write up to BLOCK_WRITE_SIZE data
             data = buffer[offset:offset + count]
             self._i2c_write_byte(0x10, 0x20)
-            self.i2c.writeto(I2C_BLOCK_ADDR, data)
+            self._i2c.writeto(I2C_BLOCK_ADDR, data)
             
-            self.i2c.writeto(I2C_DATA_ADDR, bytes([0xFF]))
+            self._i2c.writeto(I2C_DATA_ADDR, bytes([0xFF]))
             self._i2c_write_byte(0x10, 0x00)
             
             # Write disable
@@ -847,7 +848,7 @@ class ITEFlasher:
         # We need to resend fast read command at 256KB boundary
         # If wdt_enable, we need to reduce to 4KB to avoid the wdt interrupt
         boundary = 0x40000 # 256K
-        if self.wdt_enable:
+        if self.wdt_enabled:
             boundary = 0x1000 # 4K
         
         self.spi_flash_follow_mode()
@@ -874,13 +875,13 @@ class ITEFlasher:
                 self._spi_flash_command_short(SPI_CMD_WORD_PROGRAM)
                 
                 # Address of AAI command
-                self.i2c.writeto(I2C_DATA_ADDR, bytes([addr_h]))
-                self.i2c.writeto(I2C_DATA_ADDR, bytes([addr_m]))
-                self.i2c.writeto(I2C_DATA_ADDR, bytes([addr_l]))
+                self._i2c.writeto(I2C_DATA_ADDR, bytes([addr_h]))
+                self._i2c.writeto(I2C_DATA_ADDR, bytes([addr_m]))
+                self._i2c.writeto(I2C_DATA_ADDR, bytes([addr_l]))
                 
                 # Send first two bytes of buffer
-                self.i2c.writeto(I2C_DATA_ADDR, bytes(f.read(1)))
-                self.i2c.writeto(I2C_DATA_ADDR, bytes(f.read(1)))
+                self._i2c.writeto(I2C_DATA_ADDR, bytes(f.read(1)))
+                self._i2c.writeto(I2C_DATA_ADDR, bytes(f.read(1)))
                 
                 # We had sent two bytes
                 offset += 2
@@ -904,7 +905,7 @@ class ITEFlasher:
                     count -= 2
                 
                 data = f.read(count)
-                self.i2c.writeto(I2C_BLOCK_ADDR, data)
+                self._i2c.writeto(I2C_BLOCK_ADDR, data)
                 
                 remaining -= count
                 offset += count
@@ -913,7 +914,7 @@ class ITEFlasher:
                 if (offset % boundary == 0) and remaining:
                     
                     # Disable quick AAI mode
-                    self.i2c.writeto(I2C_DATA_ADDR, bytes([0xFF]))
+                    self._i2c.writeto(I2C_DATA_ADDR, bytes([0xFF]))
                     self._i2c_write_byte(0x10, 0x00)
                     
                     # Write disable command
@@ -922,7 +923,7 @@ class ITEFlasher:
                     send_aai_cmd()
         
         # Disable quick AAI mode
-        self.i2c.writeto(I2C_DATA_ADDR, bytes([0xFF]))
+        self._i2c.writeto(I2C_DATA_ADDR, bytes([0xFF]))
         self._i2c_write_byte(0x10, 0x00)
         
         # Write disable command
@@ -936,6 +937,9 @@ class ITEFlasher:
         pass
 
     def write_flash(self, filename):
+        # Erase flash before writing
+        self.erase_flash()
+
         log(f"Writing {self.flash_size / 1024} kB...")
 
         if self.flash_cmd_v2:
@@ -976,26 +980,25 @@ if __name__ == "__main__":
         send_waveform=send_waveform,
         verify=verify,
         disable_watchdog=disable_watchdog,
-        disable_protect_path=disable_protect_path,
-        wdt_enable=wdt_enable
+        disable_protect_path=disable_protect_path
     )
 
     flasher.connect()
 
 
-    if mode == 0:
+    if mode == Mode.READ:
         try:
             flasher.read_flash(firmware_file)
         except Exception as e:
             error("Failed to read flash!", e)
     
-    elif mode == 1:
+    elif mode == Mode.ERASE:
         try:
             flasher.erase_flash()
         except Exception as e:
             error("Failed to erase flash!", e)
     
-    elif mode == 2:
+    elif mode == Mode.WRITE:
         try:
             flasher.write_flash(firmware_file)
         except Exception as e:
