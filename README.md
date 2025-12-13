@@ -1,6 +1,10 @@
 # Pico ITE Flasher
 
-An adaptation of Chromium OS's [iteflash](https://source.chromium.org/chromiumos/chromiumos/codesearch/+/main:src/platform/ec/util/iteflash.cc) for the Raspberry Pi Pico. The script supports reading, erasing, writing and verifying the flash of various ITE EC chips.
+An adaptation of Chromium OS's [iteflash](https://source.chromium.org/chromiumos/chromiumos/codesearch/+/main:src/platform/ec/util/iteflash.cc) for the Raspberry Pi Pico.
+
+The script supports reading, erasing, writing and verifying the flash of various ITE EC chips.
+
+Note: The code for the [I2ITE](https://github.com/c0d3z3r0/i2ite) tool was also used for guidance, e.g. for the bitbang waveform timings.
 
 ## Setup
 
